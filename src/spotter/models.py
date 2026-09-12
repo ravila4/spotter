@@ -106,6 +106,35 @@ class GarminDailySteps(Record):
     synced_at: AwareDatetime
 
 
+class GarminBodyBatteryDay(Record):
+    day: date
+    charged: NonnegativeInteger | None = None
+    charged_fetch_started_at: AwareDatetime | None = None
+    charged_fetched_at: AwareDatetime | None = None
+    charged_raw_file_path: str | None = None
+    drained: NonnegativeInteger | None = None
+    drained_fetch_started_at: AwareDatetime | None = None
+    drained_fetched_at: AwareDatetime | None = None
+    drained_raw_file_path: str | None = None
+
+
+class GarminHealthObservation(Record):
+    day: date
+    fetch_started_at: AwareDatetime
+    fetched_at: AwareDatetime
+    raw_file_path: str
+
+
+class GarminBodyBatterySample(GarminHealthObservation):
+    recorded_at: AwareDatetime
+    level: Annotated[int, Field(ge=5, le=100, strict=True)]
+
+
+class GarminVO2Daily(GarminHealthObservation):
+    category: Literal["generic", "cycling"]
+    vo2_ml_kg_min: Positive
+
+
 MODELS: dict[str, type[Record]] = {
     "body_measurements": BodyMeasurement,
     "sessions": Session,
@@ -114,4 +143,7 @@ MODELS: dict[str, type[Record]] = {
     "strength_sets": StrengthSet,
     "garmin_activities": GarminActivity,
     "garmin_daily_steps": GarminDailySteps,
+    "garmin_body_battery_days": GarminBodyBatteryDay,
+    "garmin_body_battery_samples": GarminBodyBatterySample,
+    "garmin_vo2_daily": GarminVO2Daily,
 }

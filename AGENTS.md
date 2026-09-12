@@ -51,10 +51,21 @@ code. With a programmatic tool runner, pass arguments as an argument list.
 | Read one record | `uv run spotter get TABLE ID` |
 | Add a record | `uv run spotter add TABLE '{"notes":"..."}'` |
 | Correct a record | `uv run spotter update TABLE ID '{"notes":"..."}'` |
+| Sync health for today and yesterday | `uv run spotter garmin-health-sync --timezone IANA_ZONE` |
+| Backfill health | `uv run spotter garmin-health-sync --since YYYY-MM-DD --through YYYY-MM-DD` |
+| Read latest health with dates | `uv run spotter garmin-health-latest` |
 
 Tables: `body_measurements`, `sessions`, `runs`, `exercises`, `strength_sets`,
-`garmin_activities`, `garmin_daily_steps`.
+`garmin_activities`, `garmin_daily_steps`, `garmin_body_battery_days`,
+`garmin_body_battery_samples`, `garmin_vo2_daily`.
 The database contains personal health and workout history; do not commit it.
+
+Use the user's known account timezone for health sync; ask if it is unknown.
+Garmin access is read-only. Keep raw archives and tokens outside version control.
+Report source dates along with values: the latest stored reading may be old.
+VO2 dates are daily report dates, not proven measurement dates; preserve generic
+and cycling separately. Missing data means unknown, and an unavailable sync does
+not refresh an older reading. Use the sync command to import health observations.
 
 ## Coaching and equipment
 

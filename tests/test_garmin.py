@@ -1,8 +1,17 @@
 import json
+import sqlite3
+import stat
 from datetime import date
 
+import pytest
+from garminconnect import (
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+    GarminConnectTooManyRequestsError,
+)
+
 from spotter.garmin import sync_activities, sync_daily_steps
-from spotter.store import Store
+from spotter.store import GarminActivityAlreadyImported, Store
 
 
 class FakeGarmin:
@@ -11,8 +20,6 @@ class FakeGarmin:
         self.downloaded = []
 
     def get_activities_by_date(self, startdate, enddate):
-        assert startdate == "2026-09-10"
-        assert enddate == "2026-09-11"
         return self.activities
 
     def get_activity_details(self, activity_id):
@@ -57,7 +64,9 @@ def test_sync_creates_run_with_garmin_provenance(tmp_path):
     assert (imported["average_heart_rate"], imported["max_heart_rate"]) == (148.0, 171.0)
     assert imported["run_id"] == run["id"]
     assert json.loads(imported["details_json"])["samples"][0]["heartRate"] == 142
-    assert (tmp_path / "garmin" / "12345.zip").read_bytes() == b"original-fit-zip"
+    archives = list((tmp_path / "garmin").glob("12345-*.zip"))
+    assert len(archives) == 1
+    assert archives[0].read_bytes() == b"original-fit-zip"
 
 
 def test_sync_is_idempotent(tmp_path):
@@ -167,3 +176,172 @@ def test_daily_step_failure_identifies_retryable_date(tmp_path):
         "updated": 0,
         "failures": [{"day": "2026-09-11", "reason": "Garmin timed out"}],
     }
+
+
+def test_two_nearby_garmin_runs_get_distinct_runs(tmp_path):
+    first = running_activity()
+    second = running_activity() | {
+        "activityId": 67890,
+        "startTimeGMT": "2026-09-11 11:40:00",
+        "distance": 2000.0,
+    }
+    store = Store(tmp_path / "spotter.sqlite3")
+
+    result = sync_activities(
+        store,
+        FakeGarmin([first, second]),
+        start_date=date(2026, 9, 11),
+        end_date=date(2026, 9, 11),
+        archive_dir=tmp_path / "garmin",
+    )
+
+    imports = store.list("garmin_activities")
+    assert result["imported"] == 2
+    assert len(store.list("sessions")) == 2
+    assert len(store.list("runs")) == 2
+    assert imports[0]["run_id"] != imports[1]["run_id"]
+
+
+def test_garmin_run_does_not_attach_to_strength_only_session(tmp_path):
+    store = Store(tmp_path / "spotter.sqlite3")
+    session = store.add("sessions", {"start_at": "2026-09-11T07:28:00-04:00"})
+    exercise = store.add("exercises", {"name": "Squat"})
+    store.add(
+        "strength_sets",
+        {"workout_id": session["id"], "exercise_id": exercise["id"], "set_order": 1},
+    )
+
+    sync_activities(
+        store,
+        FakeGarmin([running_activity()]),
+        start_date=date(2026, 9, 11),
+        end_date=date(2026, 9, 11),
+        archive_dir=tmp_path / "garmin",
+    )
+
+    assert len(store.list("sessions")) == 2
+    assert store.list("runs")[0]["workout_id"] != session["id"]
+
+
+def test_fit_archives_are_owner_only_even_when_directory_exists(tmp_path):
+    archive_dir = tmp_path / "garmin"
+    archive_dir.mkdir(mode=0o755)
+
+    sync_activities(
+        Store(tmp_path / "spotter.sqlite3"),
+        FakeGarmin([running_activity()]),
+        start_date=date(2026, 9, 11),
+        end_date=date(2026, 9, 11),
+        archive_dir=archive_dir,
+    )
+
+    assert stat.S_IMODE(archive_dir.stat().st_mode) == 0o700
+    archive = next(archive_dir.glob("12345-*.zip"))
+    assert stat.S_IMODE(archive.stat().st_mode) == 0o600
+
+
+def test_activity_id_cannot_escape_archive_directory(tmp_path):
+    activity = running_activity() | {"activityId": "../escape"}
+    store = Store(tmp_path / "spotter.sqlite3")
+
+    result = sync_activities(
+        store,
+        FakeGarmin([activity]),
+        start_date=date(2026, 9, 11),
+        end_date=date(2026, 9, 11),
+        archive_dir=tmp_path / "garmin",
+    )
+
+    assert result["failures"][0]["garmin_activity_id"] == "../escape"
+    assert not (tmp_path / "escape.zip").exists()
+    assert store.list("sessions") == []
+
+
+def test_connection_error_is_attributed_and_later_activity_continues(tmp_path):
+    class FlakyGarmin(FakeGarmin):
+        def get_activity_details(self, activity_id):
+            if activity_id == "12345":
+                raise GarminConnectConnectionError("timed out")
+            return super().get_activity_details(activity_id)
+
+    second = running_activity() | {"activityId": 67890, "startTimeGMT": "2026-09-11 13:00:00"}
+    store = Store(tmp_path / "spotter.sqlite3")
+
+    result = sync_activities(
+        store,
+        FlakyGarmin([running_activity(), second]),
+        start_date=date(2026, 9, 11),
+        end_date=date(2026, 9, 11),
+        archive_dir=tmp_path / "garmin",
+    )
+
+    assert result["imported"] == 1
+    assert result["failures"] == [{"garmin_activity_id": "12345", "reason": "timed out"}]
+
+
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        (GarminConnectAuthenticationError("expired"), "garmin-login"),
+        (GarminConnectTooManyRequestsError("slow down"), "retry later"),
+    ],
+)
+def test_account_level_errors_stop_with_recovery_guidance(tmp_path, error, expected):
+    class BlockedGarmin(FakeGarmin):
+        def get_activities_by_date(self, startdate, enddate):
+            raise error
+
+    with pytest.raises(ValueError, match=expected):
+        sync_activities(
+            Store(tmp_path / "spotter.sqlite3"),
+            BlockedGarmin([]),
+            start_date=date(2026, 9, 11),
+            end_date=date(2026, 9, 11),
+            archive_dir=tmp_path / "garmin",
+        )
+
+
+def test_database_failure_leaves_no_archive_or_partial_records(tmp_path, monkeypatch):
+    store = Store(tmp_path / "spotter.sqlite3")
+    monkeypatch.setattr(
+        store,
+        "save_garmin_activity",
+        lambda **kwargs: (_ for _ in ()).throw(sqlite3.IntegrityError("forced failure")),
+    )
+
+    result = sync_activities(
+        store,
+        FakeGarmin([running_activity()]),
+        start_date=date(2026, 9, 11),
+        end_date=date(2026, 9, 11),
+        archive_dir=tmp_path / "garmin",
+    )
+
+    assert result["failures"] == [{"garmin_activity_id": "12345", "reason": "forced failure"}]
+    assert list((tmp_path / "garmin").glob("12345-*.zip")) == []
+    assert store.list("sessions") == []
+
+
+def test_losing_same_activity_import_does_not_delete_winner_archive(tmp_path, monkeypatch):
+    archive_dir = tmp_path / "garmin"
+    archive_dir.mkdir()
+    winner = archive_dir / "12345-winner.zip"
+    winner.write_bytes(b"winner")
+    store = Store(tmp_path / "spotter.sqlite3")
+    monkeypatch.setattr(
+        store,
+        "save_garmin_activity",
+        lambda **kwargs: (_ for _ in ()).throw(GarminActivityAlreadyImported("claimed")),
+    )
+
+    result = sync_activities(
+        store,
+        FakeGarmin([running_activity()]),
+        start_date=date(2026, 9, 11),
+        end_date=date(2026, 9, 11),
+        archive_dir=archive_dir,
+    )
+
+    assert result == {"imported": 0, "skipped": 1, "failures": []}
+    assert winner.read_bytes() == b"winner"
+    assert list(archive_dir.iterdir()) == [winner]

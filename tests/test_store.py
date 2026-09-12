@@ -2,7 +2,7 @@ import sqlite3
 
 import pytest
 
-from spotter.store import Store
+from spotter.store import GarminRunAlreadyClaimed, Store
 
 
 @pytest.fixture
@@ -157,3 +157,66 @@ def test_filter_sets_by_workout(store):
     store.add("strength_sets", {"workout_id": first["id"], "reps": 8})
     store.add("strength_sets", {"workout_id": second["id"], "reps": 10})
     assert [row["reps"] for row in store.list("strength_sets", workout_id=first["id"])] == [8]
+
+
+def test_garmin_import_rolls_back_new_session_and_run_on_invalid_provenance(store):
+    with pytest.raises(ValueError):
+        store.save_garmin_activity(
+            session_id=None,
+            session_values={"start_at": "2026-09-11T11:30:00Z"},
+            run_id=None,
+            run_values={"distance": 5, "distance_unit": "km"},
+            garmin_values={"activity_type": None},
+        )
+
+    assert store.list("sessions") == []
+    assert store.list("runs") == []
+    assert store.list("garmin_activities") == []
+
+
+def test_garmin_import_rolls_back_existing_run_update_on_invalid_provenance(store):
+    session = store.add("sessions", {"start_at": "2026-09-11T11:30:00Z"})
+    run = store.add("runs", {"workout_id": session["id"], "notes": "Keep me"})
+
+    with pytest.raises(ValueError):
+        store.save_garmin_activity(
+            session_id=session["id"],
+            session_values={},
+            run_id=run["id"],
+            run_values={"distance": 5, "distance_unit": "km"},
+            garmin_values={"activity_type": None},
+        )
+
+    assert store.get("runs", run["id"])["distance"] is None
+    assert store.get("runs", run["id"])["notes"] == "Keep me"
+
+
+def test_stale_run_selection_cannot_be_claimed_by_second_garmin_activity(store):
+    session = store.add("sessions", {"start_at": "2026-09-11T11:30:00Z"})
+    run = store.add("runs", {"workout_id": session["id"]})
+    provenance = {
+        "activity_type": "running",
+        "start_at": "2026-09-11T11:30:00Z",
+        "imported_at": "2026-09-11T12:00:00Z",
+        "raw_file_path": "/private/activity.zip",
+        "details_json": "{}",
+    }
+    store.save_garmin_activity(
+        session_id=session["id"],
+        session_values={},
+        run_id=run["id"],
+        run_values={"distance": 5, "distance_unit": "km"},
+        garmin_values=provenance | {"garmin_activity_id": "111"},
+    )
+
+    with pytest.raises(GarminRunAlreadyClaimed):
+        store.save_garmin_activity(
+            session_id=session["id"],
+            session_values={},
+            run_id=run["id"],
+            run_values={"distance": 2, "distance_unit": "km"},
+            garmin_values=provenance | {"garmin_activity_id": "222"},
+        )
+
+    assert store.get("runs", run["id"])["distance"] == 5
+    assert len(store.list("garmin_activities")) == 1

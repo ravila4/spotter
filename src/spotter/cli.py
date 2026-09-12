@@ -3,7 +3,7 @@ import getpass
 import json
 import sqlite3
 import sys
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,7 @@ from garminconnect import (
 )
 
 from spotter.garmin import GarminCloudClient, sync_activities, sync_daily_steps
+from spotter.health import health_dates, sync_health
 from spotter.models import MODELS
 from spotter.store import Store
 
@@ -48,6 +49,19 @@ def _parser() -> argparse.ArgumentParser:
     sync.add_argument(
         "--garmin-dir", type=Path, default=GARMIN_DIR, help="Private Garmin data path"
     )
+    health = commands.add_parser(
+        "garmin-health-sync", help="Import Body Battery and daily VO2 estimates"
+    )
+    health.add_argument("--since", type=date.fromisoformat, help="First health date (YYYY-MM-DD)")
+    health.add_argument("--through", type=date.fromisoformat, help="Last health date (YYYY-MM-DD)")
+    health.add_argument("--timezone", help="Account IANA timezone; required without --through")
+    health.add_argument(
+        "--garmin-dir", type=Path, default=GARMIN_DIR, help="Private Garmin data path"
+    )
+    commands.add_parser(
+        "garmin-health-latest",
+        help="Read latest stored health observations with dates and fetch times",
+    )
     for name in ("add", "update", "get", "list"):
         command = commands.add_parser(name)
         command.add_argument("table", choices=MODELS)
@@ -65,6 +79,7 @@ def _execute(args: argparse.Namespace) -> Any:
         return {name: model.model_json_schema() for name, model in MODELS.items()}
     if args.command == "garmin-login":
         GARMIN_TOKENS.mkdir(parents=True, exist_ok=True, mode=0o700)
+        GARMIN_TOKENS.chmod(0o700)
         email = args.email or input("Garmin Connect email: ")
         password = getpass.getpass("Garmin Connect password: ")
         client = Garmin(email, password, prompt_mfa=lambda: input("Garmin MFA code: "))
@@ -84,6 +99,21 @@ def _execute(args: argparse.Namespace) -> Any:
             return store.get(args.table, args.record_id)
         case "list":
             return store.list(args.table, workout_id=args.workout_id)
+        case "garmin-health-latest":
+            return store.latest_garmin_health()
+        case "garmin-health-sync":
+            since, through = health_dates(
+                args.since, args.through, args.timezone, now=datetime.now(UTC)
+            )
+            client = Garmin()
+            client.login(str(GARMIN_TOKENS))
+            return sync_health(
+                store,
+                client,
+                start_date=since,
+                end_date=through,
+                archive_dir=args.garmin_dir / "health",
+            )
         case "garmin-sync":
             activity_since, step_since, through = _garmin_sync_dates(
                 args.since, args.through, today=date.today()

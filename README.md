@@ -52,6 +52,9 @@ include a timezone offset. The Python models define the schema and validation;
 | Strength sets | Workout ID, exercise ID, set order, reps, weight and unit, effort note |
 | Garmin activities | Garmin activity ID, linked workout/run, activity type, heart rate, calories, import metadata, raw details |
 | Garmin daily steps | Calendar date, total steps, optional step goal, last sync time |
+| Garmin Body Battery days | Calendar date, charged/drained totals, separate retrieval times and source paths for each total |
+| Garmin Body Battery samples | UTC observation time, Garmin calendar date, level (5–100), retrieval times and source path |
+| Garmin daily VO2 | Report date, generic/cycling category, estimate in ml/kg/min, retrieval times and source path |
 
 Each set order is unique within a workout and exercise when all three values are
 known. Foreign keys reject references to nonexistent workouts or exercises.
@@ -97,8 +100,8 @@ The sync runs after the watch uploads a completed activity to Garmin Connect.
 It downloads Garmin's original FIT archive to
 `~/.local/share/spotter/garmin/activities/`, preserves the detailed activity
 response, and records average and maximum heart rate. Running activities create
-or enrich a Spotter run. A session beginning within 30 minutes is treated as the
-same workout. Garmin activity IDs prevent duplicate imports. The command also
+or enrich a Spotter run. An unclaimed run in a session beginning within 30 minutes
+can be matched to the activity. Garmin activity IDs prevent duplicate imports. The command also
 creates or refreshes one daily step-total record per date, including the current
 day's growing total.
 
@@ -106,6 +109,51 @@ Successful syncs return `synced: true`. A partial failure returns a nonzero exit
 code and identifies each activity that can be retried. This integration uses
 Garmin Connect's private interface through `python-garminconnect`; Garmin changes
 may occasionally require a dependency update or another login.
+
+### Body Battery and VO2 max
+
+Health sync uses the same saved login. Supply the account's IANA timezone to
+refresh today and yesterday; this example uses UTC:
+
+```sh
+uv run spotter garmin-health-sync --timezone Etc/UTC
+```
+
+Backfill an inclusive date range without relying on the computer's timezone:
+
+```sh
+uv run spotter garmin-health-sync --since 2026-09-01 --through 2026-09-11
+uv run spotter garmin-health-latest
+uv run spotter list garmin_body_battery_days
+uv run spotter list garmin_body_battery_samples
+uv run spotter list garmin_vo2_daily
+```
+
+Body Battery stores timestamped readings and daily charged/drained totals.
+VO2 records preserve Garmin's `generic` and `cycling` categories. Their dates
+identify daily reports, not necessarily new measurements; an estimate can be
+repeated across days. Values use ml/kg/min. The latest query includes source dates
+and retrieval times, so an older reading remains distinguishable from a current one.
+Table listings use insertion order; sort by observation/report date for plots.
+
+Each endpoint/date reports `saved`, `unchanged`, `unavailable`, or `failed`.
+Unavailable data does not erase or refresh older observations. Corrections can
+lower values. Request-start times prevent an earlier request from overwriting a
+later request's observations; this assumes a stable computer clock and does not
+establish Garmin's revision order. A malformed response saves no rows from that
+endpoint/date. Authentication errors and rate limits stop the remaining requests.
+Connection failures leave independent endpoints retryable and return a nonzero exit.
+
+Source JSON is stored privately under `~/.local/share/spotter/garmin/health/` with
+file mode 0600 and directory mode 0700. Both sync commands accept `--garmin-dir`
+to change their archive root. Keep that directory outside version control.
+An abrupt process termination between archiving and committing can leave an
+unreferenced private file. Missing samples are retained; omission alone does not
+prove deletion. Uploads older than the default two-day window need a backfill.
+
+The commands only read Garmin Connect. They do not change goals, upload activities,
+or provide live sensor streaming. See [health data design](docs/garmin-health-plan.md)
+for payload contracts and storage details.
 
 ## Development
 

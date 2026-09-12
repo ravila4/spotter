@@ -1,12 +1,21 @@
 import json
+import os
+import sqlite3
+import tempfile
 from collections.abc import Mapping
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
+from uuid import uuid4
 
-from garminconnect import Garmin
+from garminconnect import (
+    Garmin,
+    GarminConnectAuthenticationError,
+    GarminConnectConnectionError,
+    GarminConnectTooManyRequestsError,
+)
 
-from spotter.store import Store
+from spotter.store import GarminActivityAlreadyImported, GarminRunAlreadyClaimed, Store
 
 
 class GarminClient(Protocol):
@@ -57,16 +66,26 @@ def _activity_type(activity: Mapping[str, Any]) -> str:
     return value["typeKey"]
 
 
-def _find_nearby_session(store: Store, start_at: datetime) -> dict[str, Any] | None:
+def _find_compatible_run(
+    store: Store, start_at: datetime
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
     candidates = []
-    for session in store.list("sessions"):
+    for run in store.list("runs"):
+        if store.find_one("garmin_activities", "run_id", run["id"]) is not None:
+            continue
+        if run["workout_id"] is None:
+            continue
+        session = store.get("sessions", run["workout_id"])
         if session["start_at"] is None:
             continue
         recorded = datetime.fromisoformat(session["start_at"])
         difference = abs((recorded.astimezone(UTC) - start_at.astimezone(UTC)).total_seconds())
         if difference <= 30 * 60:
-            candidates.append((difference, session))
-    return min(candidates, key=lambda candidate: candidate[0])[1] if candidates else None
+            candidates.append((difference, session, run))
+    if not candidates:
+        return None
+    _, session, run = min(candidates, key=lambda candidate: candidate[0])
+    return session, run
 
 
 def _is_run(activity_type: str) -> bool:
@@ -89,6 +108,34 @@ def _number(activity: Mapping[str, Any], field: str) -> float | None:
     return float(value) if isinstance(value, int | float) else None
 
 
+def _validate_activity_id(activity_id: str) -> None:
+    if not activity_id.isascii() or not activity_id.isdigit() or int(activity_id) <= 0:
+        raise ValueError("Garmin activity ID must be a positive integer")
+
+
+def _write_private_archive(archive_dir: Path, activity_id: str, content: bytes) -> Path:
+    archive_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    archive_dir.chmod(0o700)
+    final_path = archive_dir / f"{activity_id}-{uuid4().hex}.zip"
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{activity_id}.", dir=archive_dir)
+    temporary_path = Path(temporary_name)
+    try:
+        os.fchmod(descriptor, 0o600)
+        stream = os.fdopen(descriptor, "wb")
+        descriptor = -1
+        with stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary_path.replace(final_path)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary_path.unlink(missing_ok=True)
+        raise
+    return final_path
+
+
 def sync_activities(
     store: Store,
     client: GarminClient,
@@ -98,11 +145,17 @@ def sync_activities(
     archive_dir: Path,
 ) -> dict[str, Any]:
     """Import completed Garmin activities while keeping failed items retryable."""
-    activities = client.get_activities_by_date(start_date.isoformat(), end_date.isoformat())
+    try:
+        activities = client.get_activities_by_date(start_date.isoformat(), end_date.isoformat())
+    except GarminConnectAuthenticationError as error:
+        raise ValueError("Garmin authentication failed; run spotter garmin-login again") from error
+    except GarminConnectTooManyRequestsError as error:
+        raise ValueError("Garmin rate limited activity sync; retry later") from error
     imported = 0
     skipped = 0
     failures: list[dict[str, str]] = []
     archive_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    archive_dir.chmod(0o700)
 
     for activity in activities:
         activity_id = str(activity.get("activityId", ""))
@@ -113,31 +166,22 @@ def sync_activities(
             skipped += 1
             continue
         try:
+            _validate_activity_id(activity_id)
             start_at = _start_at(activity)
             activity_type = _activity_type(activity)
             details = client.get_activity_details(activity_id)
             original = client.download_original_activity(activity_id)
-            archive_path = archive_dir / f"{activity_id}.zip"
-            archive_path.write_bytes(original)
+            archive_path = _write_private_archive(archive_dir, activity_id, original)
 
-            session = _find_nearby_session(store, start_at)
-            if session is None:
-                session = store.add("sessions", {"start_at": start_at.isoformat()})
+            session = None
             run = None
             if _is_run(activity_type):
-                run = store.find_one("runs", "workout_id", session["id"])
-                values = _run_values(activity) | {"workout_id": session["id"]}
-                run = (
-                    store.add("runs", values)
-                    if run is None
-                    else store.update("runs", run["id"], values)
-                )
-            store.add(
-                "garmin_activities",
-                {
+                match = _find_compatible_run(store, start_at)
+                if match is not None:
+                    session, run = match
+            try:
+                import_values = {
                     "garmin_activity_id": activity_id,
-                    "workout_id": session["id"],
-                    "run_id": None if run is None else run["id"],
                     "activity_type": activity_type,
                     "activity_name": activity.get("activityName"),
                     "start_at": start_at.isoformat(),
@@ -147,10 +191,48 @@ def sync_activities(
                     "imported_at": datetime.now(UTC).isoformat(),
                     "raw_file_path": str(archive_path),
                     "details_json": json.dumps(details, separators=(",", ":")),
-                },
-            )
+                }
+                try:
+                    store.save_garmin_activity(
+                        session_id=None if session is None else session["id"],
+                        session_values={"start_at": start_at.isoformat()},
+                        run_id=None if run is None else run["id"],
+                        run_values=_run_values(activity) if _is_run(activity_type) else None,
+                        garmin_values=import_values,
+                    )
+                except GarminRunAlreadyClaimed:
+                    store.save_garmin_activity(
+                        session_id=None,
+                        session_values={"start_at": start_at.isoformat()},
+                        run_id=None,
+                        run_values=_run_values(activity),
+                        garmin_values=import_values,
+                    )
+            except GarminActivityAlreadyImported:
+                archive_path.unlink(missing_ok=True)
+                skipped += 1
+                continue
+            except (KeyError, sqlite3.Error, TypeError, ValueError):
+                archive_path.unlink(missing_ok=True)
+                raise
             imported += 1
-        except (KeyError, OSError, TypeError, ValueError) as error:
+        except GarminConnectAuthenticationError as error:
+            raise ValueError(
+                f"Garmin activity {activity_id} authentication failed; "
+                "run spotter garmin-login again"
+            ) from error
+        except GarminConnectTooManyRequestsError as error:
+            raise ValueError(
+                f"Garmin activity {activity_id} was rate limited; retry later"
+            ) from error
+        except (
+            GarminConnectConnectionError,
+            KeyError,
+            OSError,
+            sqlite3.Error,
+            TypeError,
+            ValueError,
+        ) as error:
             failures.append({"garmin_activity_id": activity_id, "reason": str(error)})
 
     return {"imported": imported, "skipped": skipped, "failures": failures}
@@ -192,7 +274,22 @@ def sync_daily_steps(
             else:
                 store.update("garmin_daily_steps", existing["id"], values)
                 updated += 1
-        except (KeyError, OSError, TypeError, ValueError) as error:
+        except GarminConnectAuthenticationError as error:
+            raise ValueError(
+                f"Garmin daily steps for {day_text} authentication failed; "
+                "run spotter garmin-login again"
+            ) from error
+        except GarminConnectTooManyRequestsError as error:
+            raise ValueError(
+                f"Garmin daily steps for {day_text} were rate limited; retry later"
+            ) from error
+        except (
+            GarminConnectConnectionError,
+            KeyError,
+            OSError,
+            TypeError,
+            ValueError,
+        ) as error:
             failures.append({"day": day_text, "reason": str(error)})
         day += timedelta(days=1)
     return {"created": created, "updated": updated, "failures": failures}

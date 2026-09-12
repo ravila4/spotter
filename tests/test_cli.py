@@ -1,7 +1,9 @@
 import json
+import stat
 import subprocess
 import sys
 from datetime import date
+from types import SimpleNamespace
 
 import spotter.cli
 
@@ -84,3 +86,66 @@ def test_default_garmin_sync_backfills_activities_but_only_today_steps():
         date(2026, 9, 11),
         date(2026, 9, 11),
     )
+
+
+def test_garmin_login_repairs_token_directory_permissions(tmp_path, monkeypatch):
+    token_dir = tmp_path / "tokens"
+    token_dir.mkdir(mode=0o755)
+
+    class FakeLogin:
+        def __init__(self, email, password, prompt_mfa):
+            pass
+
+        def login(self, path):
+            assert path == str(token_dir)
+
+    monkeypatch.setattr(spotter.cli, "GARMIN_TOKENS", token_dir)
+    monkeypatch.setattr(spotter.cli, "Garmin", FakeLogin)
+    monkeypatch.setattr(spotter.cli.getpass, "getpass", lambda prompt: "secret")
+
+    spotter.cli._execute(SimpleNamespace(command="garmin-login", email="user@example.com"))
+
+    assert stat.S_IMODE(token_dir.stat().st_mode) == 0o700
+
+
+def test_health_sync_requires_date_context_before_login(tmp_path, monkeypatch, capsys):
+    def unexpected_login():
+        raise AssertionError("Login must not happen before date validation")
+
+    monkeypatch.setattr(spotter.cli, "Garmin", unexpected_login)
+    status = spotter.cli.main(["--db", str(tmp_path / "test.sqlite3"), "garmin-health-sync"])
+    assert status == 1
+    assert "timezone" in capsys.readouterr().err
+
+
+def test_health_sync_cli_persists_response(tmp_path, monkeypatch, capsys):
+    class HealthClient:
+        def login(self, path):
+            pass
+
+        def get_body_battery(self, start, end):
+            assert start == end == "2025-01-02"
+            return []
+
+        def get_max_metrics(self, day):
+            return [{"generic": {"calendarDate": day, "vo2MaxPreciseValue": 48.2}}]
+
+    monkeypatch.setattr(spotter.cli, "Garmin", HealthClient)
+    path = tmp_path / "test.sqlite3"
+    status = spotter.cli.main(
+        [
+            "--db",
+            str(path),
+            "garmin-health-sync",
+            "--since",
+            "2025-01-02",
+            "--through",
+            "2025-01-02",
+            "--garmin-dir",
+            str(tmp_path / "private"),
+        ]
+    )
+    assert status == 0
+    assert json.loads(capsys.readouterr().out)["synced"] is True
+    rows = spotter.cli.Store(path).list("garmin_vo2_daily")
+    assert rows[0]["vo2_ml_kg_min"] == 48.2
