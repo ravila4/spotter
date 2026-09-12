@@ -50,6 +50,8 @@ include a timezone offset. The Python models define the schema and validation;
 | Runs | Workout ID, distance and unit, duration in seconds, moving/elapsed duration kind, reported pace and unit/kind, maximum speed and unit |
 | Exercises | Name, equipment description |
 | Strength sets | Workout ID, exercise ID, set order, reps, weight and unit, effort note |
+| Garmin activities | Garmin activity ID, linked workout/run, activity type, heart rate, calories, import metadata, raw details |
+| Garmin daily steps | Calendar date, total steps, optional step goal, last sync time |
 
 Each set order is unique within a workout and exercise when all three values are
 known. Foreign keys reject references to nonexistent workouts or exercises.
@@ -61,10 +63,49 @@ No average pace is returned when distance or duration is missing or distance is
 zero. Distance units are m, km, or mi; weights use kg or lb. Reported pace uses
 sec/km or sec/mi, and maximum speed uses km/h or mph.
 
-The initial version has no dashboard, natural-language parser, or device imports.
-Your agent interprets speech/text and photos; these tools handle storage. Keep
-watch samples, heart rate, and sleep for a later extension when data is available.
-The database is gitignored. Back it up separately if you want to retain history.
+The initial version has no dashboard or natural-language parser. Your agent
+interprets speech, text, and photos; these tools handle storage. The database is
+gitignored. Back it up separately if you want to retain history.
+
+## Garmin Connect sync
+
+Authenticate once from an interactive terminal:
+
+```sh
+uv run spotter garmin-login
+```
+
+The command prompts for the Garmin Connect email, password, and MFA code when
+required. It stores reusable login tokens under
+`~/.config/spotter/garmin/`; it does not store the password. Garmin may require
+another login after a password or security change, token invalidation, or an
+upstream authentication change.
+
+Import activities from the last seven days:
+
+```sh
+uv run spotter garmin-sync
+```
+
+Choose an explicit range when backfilling older activities:
+
+```sh
+uv run spotter garmin-sync --since 2026-09-01 --through 2026-09-11
+```
+
+The sync runs after the watch uploads a completed activity to Garmin Connect.
+It downloads Garmin's original FIT archive to
+`~/.local/share/spotter/garmin/activities/`, preserves the detailed activity
+response, and records average and maximum heart rate. Running activities create
+or enrich a Spotter run. A session beginning within 30 minutes is treated as the
+same workout. Garmin activity IDs prevent duplicate imports. The command also
+creates or refreshes one daily step-total record per date, including the current
+day's growing total.
+
+Successful syncs return `synced: true`. A partial failure returns a nonzero exit
+code and identifies each activity that can be retried. This integration uses
+Garmin Connect's private interface through `python-garminconnect`; Garmin changes
+may occasionally require a dependency update or another login.
 
 ## Development
 

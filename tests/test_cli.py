@@ -1,6 +1,9 @@
 import json
 import subprocess
 import sys
+from datetime import date
+
+import spotter.cli
 
 
 def invoke(path, *args):
@@ -56,3 +59,28 @@ def test_cli_init(tmp_path):
     result = invoke(path, "init")
     assert result.returncode == 0
     assert path.exists()
+
+
+def test_partial_garmin_sync_exits_nonzero_without_claiming_success(monkeypatch, capsys):
+    result = {
+        "synced": False,
+        "imported": 0,
+        "skipped": 0,
+        "failures": [{"garmin_activity_id": "12345", "reason": "Garmin timed out"}],
+    }
+    monkeypatch.setattr(spotter.cli, "_execute", lambda args: result)
+
+    status = spotter.cli.main(["garmin-sync"])
+
+    captured = capsys.readouterr()
+    assert status == 1
+    assert captured.out == ""
+    assert json.loads(captured.err) == result
+
+
+def test_default_garmin_sync_backfills_activities_but_only_today_steps():
+    assert spotter.cli._garmin_sync_dates(None, None, today=date(2026, 9, 11)) == (
+        date(2026, 9, 4),
+        date(2026, 9, 11),
+        date(2026, 9, 11),
+    )

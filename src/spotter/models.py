@@ -1,8 +1,10 @@
+from datetime import date
 from typing import Annotated, Literal, Self
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, model_validator
 
 Nonnegative = Annotated[float, Field(ge=0)]
+NonnegativeInteger = Annotated[int, Field(ge=0, strict=True)]
 Positive = Annotated[float, Field(gt=0)]
 Identifier = Annotated[int, Field(gt=0, strict=True)]
 WeightUnit = Literal["kg", "lb"]
@@ -82,10 +84,34 @@ class StrengthSet(Record):
     effort_note: str | None = None
 
 
+class GarminActivity(Record):
+    garmin_activity_id: str
+    workout_id: Identifier
+    run_id: Identifier | None = None
+    activity_type: str
+    activity_name: str | None = None
+    start_at: AwareDatetime
+    average_heart_rate: Nonnegative | None = None
+    max_heart_rate: Nonnegative | None = None
+    calories: Nonnegative | None = None
+    imported_at: AwareDatetime
+    raw_file_path: str
+    details_json: str
+
+
+class GarminDailySteps(Record):
+    day: date
+    total_steps: NonnegativeInteger
+    step_goal: NonnegativeInteger | None = None
+    synced_at: AwareDatetime
+
+
 MODELS: dict[str, type[Record]] = {
     "body_measurements": BodyMeasurement,
     "sessions": Session,
     "runs": Run,
     "exercises": Exercise,
     "strength_sets": StrengthSet,
+    "garmin_activities": GarminActivity,
+    "garmin_daily_steps": GarminDailySteps,
 }

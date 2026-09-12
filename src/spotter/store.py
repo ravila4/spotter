@@ -16,7 +16,15 @@ class Store:
                 columns = ["id INTEGER PRIMARY KEY"]
                 for name in model.model_fields:
                     sql_type = "TEXT"
-                    if name in {"workout_id", "exercise_id", "set_order", "reps"}:
+                    if name in {
+                        "workout_id",
+                        "exercise_id",
+                        "run_id",
+                        "set_order",
+                        "reps",
+                        "total_steps",
+                        "step_goal",
+                    }:
                         sql_type = "INTEGER"
                     elif name in {
                         "weight",
@@ -24,6 +32,9 @@ class Store:
                         "duration_seconds",
                         "reported_pace",
                         "max_speed",
+                        "average_heart_rate",
+                        "max_heart_rate",
+                        "calories",
                     }:
                         sql_type = "REAL"
                     column = f"{name} {sql_type}"
@@ -31,9 +42,15 @@ class Store:
                         column += " REFERENCES sessions(id)"
                     elif name == "exercise_id":
                         column += " REFERENCES exercises(id)"
+                    elif name == "run_id":
+                        column += " REFERENCES runs(id)"
                     columns.append(column)
                 if table == "strength_sets":
                     columns.append("UNIQUE(workout_id, exercise_id, set_order)")
+                elif table == "garmin_activities":
+                    columns.append("UNIQUE(garmin_activity_id)")
+                elif table == "garmin_daily_steps":
+                    columns.append("UNIQUE(day)")
                 connection.execute(f"CREATE TABLE IF NOT EXISTS {table} ({', '.join(columns)})")
 
     def _connect(self) -> sqlite3.Connection:
@@ -124,3 +141,14 @@ class Store:
         with closing(self._connect()) as connection:
             rows = connection.execute(query + " ORDER BY id", parameters).fetchall()
         return [self._present(table, row) for row in rows]
+
+    def find_one(self, table: str, field: str, value: Any) -> dict[str, Any] | None:
+        """Find a record by a validated model field."""
+        model = self._model(table)
+        if field not in model.model_fields:
+            raise ValueError(f"{table} has no field named {field}")
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                f"SELECT * FROM {table} WHERE {field} = ? ORDER BY id LIMIT 1", (value,)
+            ).fetchone()
+        return None if row is None else self._present(table, row)
