@@ -1,10 +1,11 @@
 # Spotter
 
-Spotter is a small, local workout log for Codex.
+Spotter is a small, local workout log for AI agents that can run shell commands.
 
-Run Spotter on a desktop or home server and connect to that Codex session from
-your phone. Tell Codex what you did in ordinary language, and it saves the workout
-as you go. For example:
+Run Spotter alongside your agent on a desktop or home server. If your agent
+supports remote sessions, you can connect from your phone during a workout.
+Tell the agent what you did in ordinary language, and it saves the workout
+through Spotter's CLI. For example:
 
 > Leg press, 80 kg, 8 reps. The last rep was hard.
 
@@ -21,7 +22,7 @@ uv sync
 uv run spotter init
 ```
 
-Have Codex read [AGENTS.md](AGENTS.md). It explains how to record workouts and
+Have your agent read [AGENTS.md](AGENTS.md). It explains how to record workouts and
 use the saved history while coaching.
 
 ## Garmin Connect
